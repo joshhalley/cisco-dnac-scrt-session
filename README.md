@@ -61,6 +61,7 @@ As Access Points and Sensors typically utilize DHCP Addressing, if lease reserva
 **Tools & Frameworks:**
 
 - Python (2.7)
+- requests (module)
 
 
 ## Authors & Maintainers
