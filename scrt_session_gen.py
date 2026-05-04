@@ -1,9 +1,9 @@
-# $language = "Python"
+# $language = "Python3"
 # $interface = "1.0"
 
 # ===========================================================================
 #
-#  Secure CRT Cisco DNAC Session Gen                  ||        ||
+#  SecureCRT Catalyst Center Session Gen              ||        ||
 #                                                     ||        ||
 #  Script: scrt_session_gen.py                       ||||      ||||
 #                                               ..:||||||:..:||||||:..
@@ -14,30 +14,113 @@
 # ===========================================================================
 import sys
 import os  # Allow operating system interaction / creation - removal directories
-import datetime  # added to identify epoch time
-import requests  # added python requests
-from requests.auth import HTTPBasicAuth  # Permit basic authentication to retrieve token
-import json  # added libraries to deal with JSON
 import warnings  # allow customization of warning levels
 import time  # added to deal with throttling issues (sleeping 60 seconds in device detail routine)
-import imp  # used to verify if needed modules are installed already
+
+try:
+    import requests  # added python requests
+    from requests.auth import HTTPBasicAuth  # Permit basic authentication to retrieve token
+except ImportError:
+    requests = None
+    HTTPBasicAuth = None
 
 warnings.filterwarnings("ignore")
-requests.packages.urllib3.disable_warnings()  # Turn off warnings
+if requests is not None:
+    requests.packages.urllib3.disable_warnings()  # Turn off warnings
+
+AUTH_TOKEN_PATH = "/dna/system/api/v1/auth/token"
+NETWORK_DEVICE_PATH = "/dna/intent/api/v1/network-device"
+SITE_HEALTH_PATH = "/dna/intent/api/v1/site-health"
+DEVICE_DETAIL_PATH = "/dna/intent/api/v1/device-detail"
+INTERFACE_BY_NAME_PATH = "/dna/intent/api/v1/interface/network-device/{device_id}/interface-name"
+
+device_count = 0
+INVALID_PATH_CHARS = '<>:"\\|?*'
+
+
+def getSecureCrtConfigPath():
+    """Return SecureCRT's active configuration folder path."""
+    option_name = "Upload Directory V2"
+    config = crt.OpenSessionConfiguration("Default")
+    original_value = config.GetOption(option_name)
+
+    try:
+        config.SetOption(option_name, "${VDS_CONFIG_PATH}")
+        config.Save()
+        config = crt.OpenSessionConfiguration("Default")
+        return config.GetOption(option_name)
+    finally:
+        config.SetOption(option_name, original_value)
+        config.Save()
+
+
+def getSecureCrtSessionDir():
+    try:
+        config_path = getSecureCrtConfigPath()
+        return os.path.join(config_path, "Sessions") + os.sep
+    except Exception:
+        return os.path.expanduser('~/Library/Application Support/VanDyke/SecureCRT/Config/Sessions/')
+
+
+def sanitizePathComponent(value):
+    cleaned = str(value).strip()
+    for char in INVALID_PATH_CHARS:
+        cleaned = cleaned.replace(char, "")
+    cleaned = cleaned.replace("/", "")
+    return cleaned or "Unknown"
+
+
+def sanitizeLocationPath(value):
+    components = [sanitizePathComponent(part) for part in str(value).split("/") if part.strip()]
+    return "/".join(components) or "Unassigned"
+
+
+def buildSitePath(site, sites_by_id):
+    components = []
+    current = site
+    seen_site_ids = set()
+
+    while current:
+        site_id = str(current.get("siteId") or "")
+        if site_id in seen_site_ids:
+            break
+        seen_site_ids.add(site_id)
+
+        site_name = str(current.get("siteName") or "").strip()
+        parent_site_name = str(current.get("parentSiteName") or "").strip()
+        if site_name and site_name not in ("All Sites", "Global"):
+            components.append(sanitizePathComponent(site_name))
+
+        parent_site_id = str(current.get("parentSiteId") or "")
+        if not parent_site_id or parent_site_name in ("All Sites", ""):
+            break
+
+        current = sites_by_id.get(parent_site_id)
+        if current is None:
+            if parent_site_name and parent_site_name != "Global":
+                components.append(sanitizePathComponent(parent_site_name))
+            break
+
+    return "/".join(reversed(components))
+
+
+def dnacUrl(path):
+    return "https://" + dnac_ip + path
+
+
+def dnacHeaders(token):
+    return {"Content-Type": "application/json", "X-Auth-Token": token}
 
 
 def checkModules():
-    try:
-        imp.find_module('requests')
-        found = True
-    except ImportError:
-        found = False
-
-    if not found:
+    if requests is None:
         crt.Dialog.MessageBox(
-            "Python Module 'requests' is not installed\nPlease install the requests module.\n\nUsing the following cli syntax:\n\nsudo pip install requests\n")
-    elif found:
-        print ("Python request module installed")
+            "Python module 'requests' is not installed.\n"
+            "Install requests into the Python 3 environment used by SecureCRT.\n\n"
+            "Example:\n\npython3 -m pip install requests\n")
+        CancelScript()
+    else:
+        print("Python requests module installed")
 
 
 
@@ -49,36 +132,36 @@ DEFBUTTON2 = 256
 IDNO = 7
 IDYES = 6
 query = crt.Dialog.MessageBox(
-    "\t       ||           ||\n\t       ||           ||\n\t      ||||        ||||\n\t..:||||||:..:||||||:..\n\t———————-—\n \tC i s c o  S y s t e m s\n\nCisco DNAC Session Creator:\n \nTwo Execution Modes Are Available\n\n Quick Mode:\n\nSite Hierachy For Devices Is Not Created\nAnd Gig0 Interfaces Are Not Populated\nFor Cisco Catalyst Switches\n\nDetailed Mode:\n\nSite Hierachy and Gig0 Interfaces Are Populated In This Mode\nDetailed Mode Requires The Rest API Intent Bundle to be active\n\n For Detailed Mode Select YES\n For Quick Mode Select NO\n",
+    "\t       ||           ||\n\t       ||           ||\n\t      ||||        ||||\n\t..:||||||:..:||||||:..\n\t———————-—\n \tC i s c o  S y s t e m s\n\nCatalyst Center Session Creator:\n \nTwo Execution Modes Are Available\n\n Quick Mode:\n\nSite Hierarchy For Devices Is Not Created\nAnd Gig0 Interfaces Are Not Populated\nFor Cisco Catalyst Switches\n\nDetailed Mode:\n\nSite Hierarchy and Gig0 Interfaces Are Populated In This Mode\nDetailed Mode Requires The REST API Bundle to be active\n\n For Detailed Mode Select YES\n For Quick Mode Select NO\n",
     "Error", ICON_INFO | BUTTON_YESNO | DEFBUTTON2)
 if query == IDNO:
     # crt.Dialog.MessageBox("quick mode selected")
-    print ("Quick Mode Selected")
+    print("Quick Mode Selected")
 elif query == IDYES:
     # crt.Dialog.MessageBox("detailed mode selected")
-    print ("Detailed:Gw Mode Selected")
+    print("Detailed:Gw Mode Selected")
 # Clear screen - only applicable when executing over CLI (not in CRT)
-os.system('clear')
+os.system('cls' if os.name == 'nt' else 'clear')
 
-global crtTab
 crtTab = crt.GetScriptTab()
 crtTab.Screen.Synchronous = True
 
-# Set EPOCH time for use in DNAC API requests - epoch is used to ensure fresh data is delivered upon request for some calls
-epoch_time = int(datetime.datetime.now().strftime("%s")) * 1000
+# Set EPOCH time for use in Catalyst Center API requests - epoch is used to ensure fresh data is delivered upon request for some calls
+epoch_time = int(time.time() * 1000)
 
-# Request DNAC IP Address via Secure CRT
-dnac_ip = crt.Dialog.Prompt("DNAC IP Address:", "default", "", False)
+# Request Catalyst Center IP Address via SecureCRT
+dnac_ip = crt.Dialog.Prompt("Catalyst Center IP Address or FQDN:", "default", "", False)
+dnac_ip = str(dnac_ip).strip().replace("https://", "").replace("http://", "").rstrip("/")
 # Unused variable at the moment
 ip = str(dnac_ip).split('.')
 # Create folder format using DNAC followed by IP Address
-folder = ('DNAC-' + dnac_ip + '/')
-# Build Root folder structure for DNAC deployment - DNAC + IP Address of node
-session_dir = os.path.expanduser('~/Library/Application Support/VanDyke/SecureCRT/Config/Sessions/')
+folder = ('DNAC-' + sanitizePathComponent(dnac_ip) + '/')
+# Build Root folder structure for Catalyst Center deployment - DNAC + IP Address of node
+session_dir = getSecureCrtSessionDir()
 
 # Request Username and Password - password hidden
-username = crt.Dialog.Prompt("Enter your DNAC GUI Username:", "default", "", False)
-password = crt.Dialog.Prompt("Enter your DNAC GUI Password:", "Logon Script", "", True)
+username = crt.Dialog.Prompt("Enter your Catalyst Center GUI Username:", "default", "", False)
+password = crt.Dialog.Prompt("Enter your Catalyst Center GUI Password:", "Logon Script", "", True)
 # Request Tacacs Username for End Devices
 device_username = crt.Dialog.Prompt("Enter your Device Username:", "default", username, False)
 
@@ -89,14 +172,15 @@ def CancelScript():
     # Routing for exiting script function without closing application
     crt.Screen.SendSpecial("MENU_SCRIPT_CANCEL")
     crt.Sleep(1)
+    sys.exit()
 
 
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 def getToken():
     # URL used to get token
-    post_url = "https://" + dnac_ip + "/api/system/v1/auth/token"
+    post_url = dnacUrl(AUTH_TOKEN_PATH)
     # ensure that requests and responses are in json format
-    headers = {'content-type': 'application/json'}
+    headers = {'Content-Type': 'application/json'}
     # create a request using gathered credentials
     response = requests.post(post_url, auth=HTTPBasicAuth(username=username, password=password), headers=headers,
                              verify=False)
@@ -123,18 +207,18 @@ def getToken():
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 def checkDevicesPresent(token):
     # use network device API to check for devices
-    url = "https://" + dnac_ip + "/api/v1/network-device"
-    header = {"content-type": "application/json", "X-Auth-Token": token}
+    url = dnacUrl(NETWORK_DEVICE_PATH)
+    header = dnacHeaders(token)
     response = requests.get(url, headers=header, verify=False)
     if response.status_code != 200:
-        print("DNAC Device Check \t\t\t FAIL")
-        crtTab.Session.SetStatusText("DNAC Device Check \t\t\t FAIL")
+        print("Catalyst Center Device Check \t\t\t FAIL")
+        crtTab.Session.SetStatusText("Catalyst Center Device Check \t\t\t FAIL")
         time.sleep(0.3)
         sys.exit()
     r_json = response.json()
     devices = r_json["response"]
-    # if the number of devices is greater than 1 test case will be considered passed
-    if len(devices) > 1:
+    # If one or more devices are present the script can create sessions.
+    if len(devices) > 0:
         print("Devices Present \t\t\t PASS")
         crtTab.Session.SetStatusText("Devices Present \t\t\t PASS")
         time.sleep(0.3)
@@ -146,97 +230,49 @@ def checkDevicesPresent(token):
 
 
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-def getSiteHierachy(token):
+def getSiteHierarchy(token):
     # create parameter list including epoch_time
     parameters = {"timestamp": epoch_time}
-    # query DNAC site health API
-    url = "https://" + dnac_ip + "/dna/intent/api/v1/site-health"
-    header = {"content-type": "application/json", "X-Auth-Token": token}
+    # query Catalyst Center site health API
+    url = dnacUrl(SITE_HEALTH_PATH)
+    header = dnacHeaders(token)
     # ensure parameters are included in the request
     response = requests.get(url, params=parameters, headers=header, verify=False)
     if response.status_code != 200:
-        print("Retrieve Site Hierachy \t\t\t FAIL")
-        crtTab.Session.SetStatusText("Retrieve Site Hierachy \t\t\t FAIL")
+        print("Retrieve Site Hierarchy \t\t\t FAIL")
+        crtTab.Session.SetStatusText("Retrieve Site Hierarchy \t\t\t FAIL")
         time.sleep(0.3)
         sys.exit()
-    print("Retrieve Site Hierachy \t\t\t PASS")
-    crtTab.Session.SetStatusText("Retrieve Site Hierachy \t\t\t PASS")
+    print("Retrieve Site Hierarchy \t\t\t PASS")
+    crtTab.Session.SetStatusText("Retrieve Site Hierarchy \t\t\t PASS")
     time.sleep(0.3)
     r_json = response.json()
     sites = r_json["response"]
-    site_list = []
-    i = 0
-    # Loop for building the top level site stucture
+    sites_by_id = {str(item.get("siteId")): item for item in sites if item.get("siteId")}
+
     for item in sites:
-        i += 1
-        site_list.append(
-            [i, item["siteName"], item["parentSiteName"], item["siteType"], item["siteId"], item["parentSiteId"]])
-        if item["parentSiteName"] == " All Sites":
-            site_name = item["siteName"]
-            site_name = str(site_name)
-            try:
-                os.makedirs(session_dir + folder + site_name)
-            except OSError:
-                if not os.path.isdir(session_dir + folder + site_name):
-                    raise
-            # Nested loop to create sub-directory from All Sites parent
-            root_site_id = item["siteId"]
-            root_site_id = str(root_site_id)
-            nested_site_list = []
-            j = 0
-            # Nested loop for 2nd level of site
-            for block in sites:
-                j += 1
-                nested_site_list.append(
-                    [j, block["siteName"], block["parentSiteName"], block["siteType"], block["siteId"],
-                     block["parentSiteId"]])
-                parent_site_id = block["parentSiteId"]
-                parent_site_id = str(parent_site_id)
-                if parent_site_id == root_site_id:
-                    # print ("Nested Loop Parent site id is", parent_site_id)
-                    # print ("Nested Loop Site id is:", root_site_id)
-                    nested_site_name = str(block["siteName"])
-                    parent_site_name = str(block["parentSiteName"])
-                    ## config again only temporary - should use directory function
-                    try:
-                        os.makedirs(session_dir + folder + site_name + '/' + nested_site_name)
-                    except OSError:
-                        if not os.path.isdir(session_dir + folder + site_name + '/' + nested_site_name):
-                            raise
-                    nroot_site_id = block["siteId"]
-                    nroot_site_id = str(nroot_site_id)
-                    child_site_list = []
-                    k = 0
-                    # Nested loop for third level of sites
-                    for part in sites:
-                        k += 1
-                        child_site_list.append(
-                            [k, part["siteName"], part["parentSiteName"], part["siteType"], part["siteId"],
-                             part["parentSiteId"]])
-                        nparent_site_id = part["parentSiteId"]
-                        nparent_site_id = str(nparent_site_id)
-                        if nparent_site_id == nroot_site_id:
-                            # print("parent site id:", nparent_site_id)
-                            # print("root site id:", nroot_site_id)
-                            child_site_name = str(part["siteName"])
-                            try:
-                                os.makedirs(
-                                    session_dir + folder + site_name + '/' + nested_site_name + '/' + child_site_name)
-                            except OSError:
-                                if not os.path.isdir(
-                                        session_dir + folder + site_name + '/' + nested_site_name + '/' + child_site_name):
-                                    raise
+        site_path = buildSitePath(item, sites_by_id)
+        if not site_path:
+            continue
+
+        full_path = session_dir + folder + site_path
+        try:
+            os.makedirs(full_path)
+        except OSError:
+            if not os.path.isdir(full_path):
+                raise
 
 
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 def getDeviceListSlow(token):
-    crtTab.Session.SetStatusText("Intent API Active - Collecting Full Device Hierachy")
+    global device_count
+    crtTab.Session.SetStatusText("Intent API Active - Collecting Full Device Hierarchy")
     time.sleep(0.3)
     # set device counter
     device_count = 0
     # GET network devices API URL
-    url = "https://" + dnac_ip + "/api/v1/network-device"
-    header = {"content-type": "application/json", "X-Auth-Token": token}
+    url = dnacUrl(NETWORK_DEVICE_PATH)
+    header = dnacHeaders(token)
     response = requests.get(url, headers=header, verify=False)
     if response.status_code != 200:
         print("Retrieve Device List \t\t\tFAIL")
@@ -257,12 +293,13 @@ def getDeviceListSlow(token):
 
         # Store hostname and strip forward slashes
         hostfile = item["hostname"]
+        vrfmgmtip = None
         # Check for incomplete entires in inventory
         if hostfile is None:
-            print ("Item has null value")
+            print("Item has null value")
             break
 
-        hostfile = hostfile.replace('/', '')
+        hostfile = sanitizePathComponent(hostfile)
 
         ipv4addr = str(item["managementIpAddress"])
         deviceID = str(item["id"])
@@ -271,44 +308,39 @@ def getDeviceListSlow(token):
         if str(item["family"]) == "Switches and Hubs":
             # print("Switches and Hubs:", str(item["type"]))
             # Derive Gig0/0 interface IP Address
-            url = "https://" + dnac_ip + "/dna/intent/api/v1/interface/network-device/" + deviceID + "/interface-name?name=GigabitEthernet0/0"
+            url = dnacUrl(INTERFACE_BY_NAME_PATH.format(device_id=deviceID))
             # print url
-            header = {"content-type": "application/json", "X-Auth-Token": token}
-            response = requests.get(url, headers=header, verify=False)
+            header = dnacHeaders(token)
+            response = requests.get(url, headers=header, params={"name": "GigabitEthernet0/0"}, verify=False)
 
             if response.status_code == 404:
                 # 404 flags when API is not updated
                 print("API Bundle not updated - not capturing Management Interface Details")
-                # pre allocating VRF variable as it will not be set due to 404
-                vrfmgmtip = ''
-                # jump to end of loop
-                continue
-
             elif response.status_code == 200:
                 z = 0  # print("Continue API Bundle updated")
+                r_json = response.json()
+                # print r_json
+                mgmtints = r_json["response"]
+                vrfmgmtip = mgmtints["ipv4Address"]
+                # print vrfmgmtip
 
-            r_json = response.json()
-            # print r_json
-            mgmtints = r_json["response"]
-            vrfmgmtip = mgmtints["ipv4Address"]
-            # print vrfmgmtip
 
         # Derive location information for each device
-        url = "https://" + dnac_ip + "/dna/intent/api/v1/device-detail"
+        url = dnacUrl(DEVICE_DETAIL_PATH)
         parameters = {"timestamp": epoch_time, "searchBy": macaddr, "identifier": "macAddress"}
-        header = {"content-type": "application/json", "X-Auth-Token": token}
+        header = dnacHeaders(token)
         response = requests.get(url, headers=header, params=parameters, verify=False)
-        # Identify if DNAC is throttling script and pause if necessary
+        # Identify if Catalyst Center is throttling script and pause if necessary
 
         if response.status_code == 429:
             # print('Throttling for 60 seconds \t\t\t Devices Processed:', device_count)
             z = 60
-            cisco_move = "> Cisco DNA Center .ılı.ılı. "
+            cisco_move = "> Catalyst Center .ılı.ılı. "
 
             while z > 0:
                 bar = '='
                 cisco_move = (bar + cisco_move)
-                crtconsole_text = ("Throttled by Cisco DNAC API Rate Limiter - Resuming in: " + str(
+                crtconsole_text = ("Throttled by Catalyst Center API Rate Limiter - Resuming in: " + str(
                     z) + " Seconds " + "Devices Added: " + str(device_count) + " " + cisco_move)
                 crtTab.Session.SetStatusText(crtconsole_text)
                 time.sleep(0.5)
@@ -328,7 +360,12 @@ def getDeviceListSlow(token):
             crtdir = session_dir + folder + location_details + '/'
 
         else:
-            location_details = location_details[7:].strip()
+            location_details = str(location_details).strip()
+            if location_details.startswith("Global/"):
+                location_details = location_details[len("Global/"):]
+            elif location_details == "Global":
+                location_details = "Unassigned"
+            location_details = sanitizeLocationPath(location_details)
             crtdir = session_dir + folder + location_details + '/'
             # print crtdir
         # Create directory if not exists and include floor level - this
@@ -340,14 +377,13 @@ def getDeviceListSlow(token):
             if not os.path.isdir(crtdir):
                 raise
 
-        global device_count
         device_count += 1
-        crt_consoletext = ("Writing Device: " + hostfile + " Hierachy: " + folder)
+        crt_consoletext = ("Writing Device: " + hostfile + " Hierarchy: " + folder)
         crtTab.Session.SetStatusText(crt_consoletext)
-        print device_count
+        print(device_count)
         createCrtFile(crtdir, ipv4addr, hostfile)
 
-        if vrfmgmtip is not None:
+        if vrfmgmtip:
             ipv4addr = vrfmgmtip
             vrfmgmtip = None
             hostfile = hostfile + '-Gig0'
@@ -357,11 +393,12 @@ def getDeviceListSlow(token):
 
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 def getDeviceListFast(token):
-    crtTab.Session.SetStatusText("Intent API Not Active - Retrieving Devices Into Root Hierachy")
+    global device_count
+    crtTab.Session.SetStatusText("Quick Mode - Retrieving Devices Into Root Hierarchy")
     # GET network devices API URL
-    url = "https://" + dnac_ip + "/api/v1/network-device"
-    # All DNAC REST API request and response content type is JSON. Note the "X-Auth-Token" string - populated with the the "token" variable
-    header = {"content-type": "application/json", "X-Auth-Token": token}
+    url = dnacUrl(NETWORK_DEVICE_PATH)
+    # All Catalyst Center REST API request and response content type is JSON. Note the "X-Auth-Token" string - populated with the the "token" variable
+    header = dnacHeaders(token)
     # Make request and get response - "response" is the response of this request
     response = requests.get(url, headers=header, verify=False)
     # Validation for successful API call (GET) request
@@ -384,7 +421,6 @@ def getDeviceListFast(token):
     i = 0
     for item in devices:
         i += 1
-        global device_count
         device_count = i
         device_list.append([i, item["hostname"], item["managementIpAddress"], item["type"]])
 
@@ -394,7 +430,7 @@ def getDeviceListFast(token):
             # print ("host file not populated for item")
             break
 
-        hostfile = hostfile.replace('/', '')
+        hostfile = sanitizePathComponent(hostfile)
         ipv4addr = item["managementIpAddress"]
         crtdir = session_dir + folder
 
@@ -404,8 +440,7 @@ def getDeviceListFast(token):
         except OSError:
             if not os.path.isdir(session_dir + folder):
                 raise
-        crtfile = session_dir + folder + hostfile + ".ini"
-        crtconsole_text = ("Writing Device: " + hostfile + " Hierachy: " + folder)
+        crtconsole_text = ("Writing Device: " + hostfile + " Hierarchy: " + folder)
         crtTab.Session.SetStatusText(crtconsole_text)
         createCrtFile(crtdir, ipv4addr, hostfile)
 
@@ -423,8 +458,8 @@ def createDirectory():
 
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 def verifyIntentAPI(token):
-    url = "http://" + dnac_ip + "/dna/intent/api/v1/network-device"
-    header = {"content-type": "application/json", "X-Auth-Token": token}
+    url = dnacUrl(NETWORK_DEVICE_PATH)
+    header = dnacHeaders(token)
     response = requests.get(url, headers=header, verify=False)
 
     if response.status_code == 404:
@@ -435,6 +470,9 @@ def verifyIntentAPI(token):
         print("Validate Intent API \t\t\t PASS")
         api_status = 1
         return api_status
+    else:
+        print("Validate Intent API \t\t\t FAIL")
+        return 0
 
 
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -442,8 +480,7 @@ def createCrtFile(crtdir, ipv4addr, hostfile):
     crtfile = crtdir + hostfile + ".ini"
     # print crtfile
     # crt.Dialog.MessageBox("Writing: " crtfile)
-    print
-    "Creating CRT file / directory "
+    print("Creating CRT file / directory ")
     crtfile1 = open(crtfile, "w")
     # tofile = input("Write what you want into the field \n")
     crtfile1.write('S:"Username"=')
@@ -789,10 +826,10 @@ def quitScrt():
     IDNO = 7
     IDYES = 6
     query = crt.Dialog.MessageBox(
-        "Complete!\n\n\nRestart of SecureCRT is needed for DNAC Sessions and Hierachy to appear.\n\n Would you like to restart Secure CRT?\n\n\n",
-        "Error", ICON_INFO | BUTTON_YESNO | DEFBUTTON1)
+        "Complete!\n\n\nRestart of SecureCRT is needed for Catalyst Center sessions and hierarchy to appear.\n\n Would you like to restart SecureCRT?\n\n\n",
+        "Error", ICON_INFO | BUTTON_YESNO | DEFBUTTON2)
     if query == IDNO:
-        print ("No action to perform")
+        print("No action to perform")
     elif query == IDYES:
         crt.Quit()
 
@@ -802,10 +839,10 @@ apiToken = getToken()
 checkDevicesPresent(apiToken)
 createDirectory()
 api_status = verifyIntentAPI(apiToken)
-getSiteHierachy(apiToken)
 
 # Depending on whether the intent API is active or not quick or detailed mode will be selected
 if api_status == 1 and query == IDYES:
+    getSiteHierarchy(apiToken)
     thegetDeviceListSlow = getDeviceListSlow(apiToken)
 elif query == IDNO:
     thegetDeviceListFast = getDeviceListFast(apiToken)
